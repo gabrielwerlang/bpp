@@ -69,16 +69,53 @@ def calculate_longitudinal_cmax(H, t, w1, w2, r_top_out, r_bot_out, theta_deg):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _arc(cx, cy, r, a0, a1, n=40):
-    """Points along a circular arc from a0 to a1 (radians, both inclusive)."""
+    """Points along a circular arc from a0 to a1 (radians, CCW)."""
     if a1 < a0:
         a1 += 2 * np.pi
     ang = np.linspace(a0, a1, n)
     return cx + r * np.cos(ang), cy + r * np.sin(ang)
 
 
+def _compute_tangent_normal(bot_cx, bot_cy, r_bot, top_cx, top_cy, r_top):
+    """
+    Compute the outward normal direction for the RIGHT-side external tangent
+    between two fillet circles.
+
+    Returns the normal angle phi_n such that the tangent points are:
+        P_bot = (bot_cx + r_bot*cos(phi_n), bot_cy + r_bot*sin(phi_n))
+        P_top = (top_cx + r_top*cos(phi_n), top_cy + r_top*sin(phi_n))
+    and the line P_bot→P_top is tangent to both circles.
+    """
+    dx = top_cx - bot_cx
+    dy = top_cy - bot_cy
+    d = np.sqrt(dx**2 + dy**2)
+    dr = r_bot - r_top  # external tangent convention
+
+    if d < 1e-10:
+        # Concentric circles — use vertical web (0° normal)
+        return 0.0
+
+    cos_val = np.clip(dr / d, -1.0, 1.0)
+    gamma = np.arccos(cos_val)
+    alpha = np.arctan2(dy, dx)
+
+    # Two candidate normal angles
+    phi1 = alpha + gamma
+    phi2 = alpha - gamma
+
+    # Choose the one pointing most to the right (max cos = max nx)
+    if np.cos(phi1) >= np.cos(phi2):
+        return phi1
+    else:
+        return phi2
+
+
 def _profile_wall(H, t, w1, w2, r_top_out, r_bot_out, theta_deg):
     """
     Returns outer and inner profile polygons for ONE corrugation period.
+
+    Uses proper external-tangent computation between fillet circles so that
+    the web smoothly connects the arcs regardless of whether w1 > w2 or w2 > w1.
 
     Coordinate convention
     ---------------------
@@ -86,69 +123,98 @@ def _profile_wall(H, t, w1, w2, r_top_out, r_bot_out, theta_deg):
     Y = H  : outer top surface (peak top)
     w1     : top flat width
     w2     : bottom flat width
-    theta  : web angle from vertical (deg)
 
     Returns
     -------
-    ox, oy   : outer profile (CCW)
-    ix, iy   : inner profile (CCW)
-    wall_x, wall_y : kept for backward compat (same as outer)
+    ox, oy   : outer profile polygon (symmetric, closed path)
+    ix, iy   : inner profile polygon
+    wall_x, wall_y : combined wall ring (for backward compat)
     """
-    theta  = np.radians(theta_deg)
-    cos_t  = np.cos(theta)
-    sin_t  = np.sin(theta)
+    # ── Validate inputs ───────────────────────────────────────────────────────
+    r_top_out = min(r_top_out, H * 0.48)
+    r_bot_out = min(r_bot_out, H * 0.48)
 
-    # Outer arc centres
-    bot_cx = w2 / 2;   bot_cy = r_bot_out
-    top_cx = w1 / 2;   top_cy = H - r_top_out
+    # ── Circle centres (right side) ──────────────────────────────────────────
+    bot_cx = w2 / 2
+    bot_cy = r_bot_out
+    top_cx = w1 / 2
+    top_cy = H - r_top_out
 
-    # Web outward normal
-    wnx = cos_t;  wny = sin_t
+    # Ensure top_cy > bot_cy (circles don't invert)
+    if top_cy <= bot_cy:
+        # Reduce radii proportionally to fit
+        available = H * 0.95
+        scale = available / (r_top_out + r_bot_out)
+        r_top_out *= scale
+        r_bot_out *= scale
+        bot_cy = r_bot_out
+        top_cy = H - r_top_out
 
-    # Tangency points (outer surface ↔ web)
-    bx_o = bot_cx + r_bot_out * wnx;  by_o = bot_cy + r_bot_out * wny
-    tx_o = top_cx + r_top_out * wnx;  ty_o = top_cy + r_top_out * wny
+    # ── Compute external tangent normal angle ─────────────────────────────────
+    phi_n = _compute_tangent_normal(bot_cx, bot_cy, r_bot_out,
+                                    top_cx, top_cy, r_top_out)
 
-    bot_wa_o = np.arctan2(by_o - bot_cy, bx_o - bot_cx)
-    top_wa_o = np.arctan2(ty_o - top_cy, tx_o - top_cx)
+    wnx = np.cos(phi_n)
+    wny = np.sin(phi_n)
+
+    # ── Outer tangent points ──────────────────────────────────────────────────
+    bx_o = bot_cx + r_bot_out * wnx
+    by_o = bot_cy + r_bot_out * wny
+    tx_o = top_cx + r_top_out * wnx
+    ty_o = top_cy + r_top_out * wny
+
+    bot_wa_o = phi_n   # angle on bottom circle at tangent point
+    top_wa_o = phi_n   # angle on top circle at tangent point
 
     def right_outer():
         xs, ys = [0.0, bot_cx], [0.0, 0.0]
+        # Bottom arc: from bottom (-π/2) to tangent point
         a0, a1 = -np.pi / 2, bot_wa_o
-        if a1 < a0: a1 += 2 * np.pi
+        if a1 < a0:
+            a1 += 2 * np.pi
         ax, ay = _arc(bot_cx, bot_cy, r_bot_out, a0, a1)
         xs.extend(ax); ys.extend(ay)
+        # Web straight line to top tangent point
         xs.append(tx_o); ys.append(ty_o)
+        # Top arc: from tangent point to top (π/2)
         a0, a1 = top_wa_o, np.pi / 2
-        if a1 < a0: a1 += 2 * np.pi
+        if a1 < a0:
+            a1 += 2 * np.pi
         ax, ay = _arc(top_cx, top_cy, r_top_out, a0, a1)
         xs.extend(ax); ys.extend(ay)
+        # Top flat back to centre
         xs.append(0.0); ys.append(H)
         return np.array(xs), np.array(ys)
 
     rx_o, ry_o = right_outer()
+    # Mirror: left side (reversed + negated x) + right side
     ox = np.concatenate([-rx_o[::-1], rx_o[1:]])
     oy = np.concatenate([ ry_o[::-1], ry_o[1:]])
 
     # ── Inner surface ─────────────────────────────────────────────────────────
-    r_bot_in = max(r_bot_out - t, 1e-4)
-    r_top_in = max(r_top_out - t, 1e-4)
+    r_bot_in = max(r_bot_out - t, 0.005)
+    r_top_in = max(r_top_out - t, 0.005)
 
-    bx_i = bot_cx + r_bot_in * wnx;  by_i = bot_cy + r_bot_in * wny
-    tx_i = top_cx + r_top_in * wnx;  ty_i = top_cy + r_top_in * wny
+    # Inner tangent uses the SAME normal direction (parallel-offset wall)
+    bx_i = bot_cx + r_bot_in * wnx
+    by_i = bot_cy + r_bot_in * wny
+    tx_i = top_cx + r_top_in * wnx
+    ty_i = top_cy + r_top_in * wny
 
-    bot_wa_i = np.arctan2(by_i - bot_cy, bx_i - bot_cx)
-    top_wa_i = np.arctan2(ty_i - top_cy, tx_i - top_cx)
+    bot_wa_i = phi_n
+    top_wa_i = phi_n
 
     def right_inner():
         xs, ys = [0.0, bot_cx], [t, t]
         a0, a1 = -np.pi / 2, bot_wa_i
-        if a1 < a0: a1 += 2 * np.pi
+        if a1 < a0:
+            a1 += 2 * np.pi
         ax, ay = _arc(bot_cx, bot_cy, r_bot_in, a0, a1)
         xs.extend(ax); ys.extend(ay)
         xs.append(tx_i); ys.append(ty_i)
         a0, a1 = top_wa_i, np.pi / 2
-        if a1 < a0: a1 += 2 * np.pi
+        if a1 < a0:
+            a1 += 2 * np.pi
         ax, ay = _arc(top_cx, top_cy, r_top_in, a0, a1)
         xs.extend(ax); ys.extend(ay)
         xs.append(0.0); ys.append(H - t)
@@ -158,7 +224,7 @@ def _profile_wall(H, t, w1, w2, r_top_out, r_bot_out, theta_deg):
     ix = np.concatenate([-rx_i[::-1], rx_i[1:]])
     iy = np.concatenate([ ry_i[::-1], ry_i[1:]])
 
-    # wall_x/wall_y kept for backward compat but no longer used for rendering
+    # Wall ring (backward compat)
     wall_x = np.concatenate([ox, ix[::-1], [ox[0]]])
     wall_y = np.concatenate([oy, iy[::-1], [oy[0]]])
     return ox, oy, ix, iy, wall_x, wall_y
@@ -171,10 +237,12 @@ def _transverse_wall(w_top, h_channel, theta_deg, t):
     theta    = np.radians(theta_deg)
     half_bot = w_top / 2 + h_channel * np.tan(theta)
     w2_trans = 2 * half_bot
-    r_fillet = min(w_top * 0.15, h_channel * 0.25, max(t * 1.2, 0.02))
-    # FIX: r_fillet must exceed t so the inner radius (r_fillet - t) stays positive
-    r_fillet = max(r_fillet, t + 0.001)
+    # Compute a reasonable fillet radius — must exceed t for valid inner radius
+    r_fillet = min(w_top * 0.20, h_channel * 0.30, max(t * 2.0, 0.05))
+    r_fillet = max(r_fillet, t * 1.5)   # ensures inner radius ≥ 0.5*t
     H_outer  = h_channel + t
+    # Cap fillet so circles fit within H_outer
+    r_fillet = min(r_fillet, H_outer * 0.45)
     return _profile_wall(H_outer, t, w_top, w2_trans, r_fillet, r_fillet, theta_deg)
 
 
@@ -182,7 +250,6 @@ def _transverse_wall(w_top, h_channel, theta_deg, t):
 # 3.  Geometry Preview figure
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Background colour used for the inner-channel "cutout" fill
 _AX_BG = "#F9FAFB"
 
 
@@ -239,33 +306,31 @@ def draw_geometry_preview(pattern_type, t,
                 H_total, t, w1, w2, r_top, r_bot, theta_deg)
             period = ox.max() - ox.min()
 
-            # Ghost periods — outer outline only (no inner cutout needed at low alpha)
+            # Ghost periods
             for shift in [-period, period]:
                 ax.fill(ox + shift, oy, facecolor=FILL, edgecolor=GHOST,
                         lw=0.7, alpha=0.35, zorder=1)
 
-            # Main period — FIX: two-fill approach instead of wall polygon
-            # 1) fill outer profile with material colour
+            # Main period — outer fill + inner punch-out
             ax.fill(ox, oy, facecolor=FILL, edgecolor=STROKE, lw=1.6, zorder=2)
-            # 2) punch out interior with background colour → wall ring appears
             ax.fill(ix, iy, facecolor=_AX_BG, edgecolor=STROKE, lw=1.0, zorder=3)
 
             xmin, xmax = ox.min(), ox.max()
 
             if NA_bot is not None:
-                ax.hlines(NA_bot, xmin-0.1, xmax+0.05,
+                ax.hlines(NA_bot, xmin - 0.1, xmax + 0.05,
                           color=NA_C, lw=1.3, ls="--", zorder=4)
-                ax.text(xmin-0.12, NA_bot, "NA", fontsize=6.5,
+                ax.text(xmin - 0.12, NA_bot, "NA", fontsize=6.5,
                         color=NA_C, va="center", ha="right")
 
             if NA_bot is not None and c_max is not None:
                 y_far = (NA_bot + c_max) if (H_total - NA_bot) > NA_bot else (NA_bot - c_max)
-                dim_arrow(xmax+0.10, NA_bot, xmax+0.10, y_far,
+                dim_arrow(xmax + 0.10, NA_bot, xmax + 0.10, y_far,
                           f"c_max\n{c_max:.3f} mm", "v", off=0.03)
 
-            dim_arrow(xmax+0.36, 0, xmax+0.36, H_total,
+            dim_arrow(xmax + 0.36, 0, xmax + 0.36, H_total,
                       f"H = {H_total:.3f} mm", "v", off=0.03)
-            dim_arrow(-w1/2, H_total+0.07, w1/2, H_total+0.07,
+            dim_arrow(-w1/2, H_total + 0.07, w1/2, H_total + 0.07,
                       f"w₁ = {w1:.2f} mm", "h", off=H_total*0.09)
             dim_arrow(-w2/2, -0.07, w2/2, -0.07,
                       f"w₂ = {w2:.2f} mm", "h", off=-H_total*0.12)
@@ -289,25 +354,25 @@ def draw_geometry_preview(pattern_type, t,
             period = ox.max() - ox.min()
             H_outer = h_channel + t
 
-            # Ghost periods — outer outline only
+            # Ghost periods
             for shift in [-period, period]:
                 ax.fill(ox + shift, oy, facecolor=FILL, edgecolor=GHOST,
                         lw=0.7, alpha=0.35, zorder=1)
 
-            # Main period — FIX: two-fill approach
+            # Main period
             ax.fill(ox, oy, facecolor=FILL, edgecolor=STROKE, lw=1.6, zorder=2)
             ax.fill(ix, iy, facecolor=_AX_BG, edgecolor=STROKE, lw=1.0, zorder=3)
 
             xmin, xmax = ox.min(), ox.max()
 
-            ax.hlines(t/2, xmin-0.1, xmax+0.05,
+            ax.hlines(t/2, xmin - 0.1, xmax + 0.05,
                       color=NA_C, lw=1.1, ls="--", zorder=4)
-            ax.text(xmin-0.12, t/2, f"NA\n(flat, t/2\n={t/2:.3f})",
+            ax.text(xmin - 0.12, t/2, f"NA\n(flat, t/2\n={t/2:.3f})",
                     fontsize=6, color=NA_C, va="center", ha="right")
 
-            dim_arrow(xmax+0.10, 0, xmax+0.10, H_outer,
+            dim_arrow(xmax + 0.10, 0, xmax + 0.10, H_outer,
                       f"H = {H_outer:.3f}\nmm (h+t)", "v", off=0.03)
-            dim_arrow(-w_top/2, H_outer+0.07, w_top/2, H_outer+0.07,
+            dim_arrow(-w_top/2, H_outer + 0.07, w_top/2, H_outer + 0.07,
                       f"w₁ = {w_top:.2f} mm", "h", off=H_outer*0.09)
 
             theta_r = np.radians(theta_deg)
@@ -317,8 +382,8 @@ def draw_geometry_preview(pattern_type, t,
                     rotation=-theta_deg)
 
             margin = period * 0.6
-            ax.set_xlim(xmin-margin, xmax+margin+0.48)
-            ax.set_ylim(-H_outer*0.32, H_outer*1.68)
+            ax.set_xlim(xmin - margin, xmax + margin + 0.48)
+            ax.set_ylim(-H_outer * 0.32, H_outer * 1.68)
 
         except Exception as e:
             ax.text(0.5, 0.5, f"Geometry error:\n{e}",
