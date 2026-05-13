@@ -66,124 +66,165 @@ def calculate_transverse_alpha(H, t, r_top_out, r_bot_out, theta_deg):
 def _build_corrugation(H, t, w1, w2, r_top_out, r_bot_out, theta_deg,
                        n_periods=3, pts_per_arc=20):
     """
-    Build continuous outer and inner profiles for a corrugated thin-wall section.
+    Build corrugated thin-wall profile using centerline + normal offset.
 
-    Profile structure (one period, left to right):
-      bottom_flat → arc1(up) → web_up → arc2(flat) → top_flat → arc3(down) → web_down → arc4(flat)
-
-    The outer profile traces the bottom (y=0) and top (y=H) surfaces.
-    The inner profile traces y=t and y=H-t with reduced fillet radii.
-    Arc centers are shared so the wall thickness is approximately uniform.
+    This ensures constant wall thickness everywhere (arcs, webs, flats)
+    and guarantees the two surface curves never intersect.
 
     Returns
     -------
-    outer_x, outer_y : ndarray
-    inner_x, inner_y : ndarray
-    info : dict with period width and central-period flat positions
+    surf1_x, surf1_y : ndarray  – surface at y=0 on bottom flats
+    surf2_x, surf2_y : ndarray  – surface at y=t on bottom flats
+    info : dict
     """
     theta = np.radians(theta_deg)
     cos_t = np.cos(theta)
     sin_t = np.sin(theta)
 
-    # Constrain radii to feasible range
-    r_top_out = min(max(r_top_out, 0.001), H * 0.45)
-    r_bot_out = min(max(r_bot_out, 0.001), H * 0.45)
-    r_top_in = max(r_top_out - t, 0.005)
-    r_bot_in = max(r_bot_out - t, 0.005)
+    # ── Centerline radii (must be positive) ────────────────────────────────
+    R_cl_bot = max(r_bot_out - t / 2, t * 0.05)
+    R_cl_top = max(r_top_out - t / 2, t * 0.05)
 
-    # Vertical arc extents (outer)
-    dy_bot = r_bot_out * (1 - sin_t)
-    dy_top = r_top_out * (1 - sin_t)
-    web_vert = H - dy_bot - dy_top
+    # ── Centerline flat y-positions ────────────────────────────────────────
+    y_cl_bot = t / 2
+    y_cl_top = H - t / 2
 
-    if web_vert < 0:
-        scale = (H * 0.9) / (dy_bot + dy_top) if (dy_bot + dy_top) > 0 else 1.0
-        r_top_out *= scale
-        r_bot_out *= scale
-        r_top_in = max(r_top_out - t, 0.005)
-        r_bot_in = max(r_bot_out - t, 0.005)
-        dy_bot = r_bot_out * (1 - sin_t)
-        dy_top = r_top_out * (1 - sin_t)
-        web_vert = H - dy_bot - dy_top
+    # ── Arc centers (y) ────────────────────────────────────────────────────
+    cy_bot = y_cl_bot + R_cl_bot          # = r_bot_out  (for r_bot_out > t/2)
+    cy_top = y_cl_top - R_cl_top          # = H - r_top_out
+
+    # ── Web geometry ───────────────────────────────────────────────────────
+    y_web_bot = cy_bot - R_cl_bot * sin_t  # CL arc endpoint y (bottom)
+    y_web_top = cy_top + R_cl_top * sin_t  # CL arc endpoint y (top)
+    web_vert = y_web_top - y_web_bot
+
+    if web_vert <= 0:
+        need = (R_cl_bot + R_cl_top) * (1 - sin_t)
+        scale = (y_cl_top - y_cl_bot) * 0.8 / need if need > 0 else 1.0
+        R_cl_bot *= scale
+        R_cl_top *= scale
+        cy_bot = y_cl_bot + R_cl_bot
+        cy_top = y_cl_top - R_cl_top
+        y_web_bot = cy_bot - R_cl_bot * sin_t
+        y_web_top = cy_top + R_cl_top * sin_t
+        web_vert = y_web_top - y_web_bot
 
     dx_web = web_vert * np.tan(theta) if cos_t > 1e-10 else 0.0
+    dx_arc_bot = R_cl_bot * cos_t
+    dx_arc_top = R_cl_top * cos_t
+    dx_transition = dx_arc_bot + dx_web + dx_arc_top
+    period = w2 + 2 * dx_transition + w1
 
-    # Period width
-    period = w2 + 2 * (r_bot_out * cos_t + dx_web + r_top_out * cos_t) + w1
-
-    # Arc center y-coordinates (shared by inner & outer)
-    cy_bot = r_bot_out
-    cy_top = H - r_top_out
-
-    def trace(r_bot, r_top, y_bot, y_top, x0):
-        """Trace one surface (outer or inner) over n_periods."""
-        xs, ys = [], []
-        x = x0
-        for _ in range(n_periods):
-            # 1. Bottom flat
-            xs.append(x); ys.append(y_bot)
-            x += w2
-            xs.append(x); ys.append(y_bot)
-
-            # 2. Arc 1: CCW from -π/2 to -θ (bottom → up-web)
-            cx1 = x
-            for a in np.linspace(-np.pi / 2, -theta, pts_per_arc + 1)[1:]:
-                xs.append(cx1 + r_bot * np.cos(a))
-                ys.append(cy_bot + r_bot * np.sin(a))
-
-            # 3. Web up — straight line to arc 2 start
-            cx2 = cx1 + r_bot_out * cos_t + dx_web + r_top_out * cos_t
-            xs.append(cx2 + r_top * np.cos(np.pi - theta))
-            ys.append(cy_top + r_top * np.sin(np.pi - theta))
-
-            # 4. Arc 2: (π−θ) → π/2 (web → top flat)
-            for a in np.linspace(np.pi - theta, np.pi / 2, pts_per_arc + 1)[1:]:
-                xs.append(cx2 + r_top * np.cos(a))
-                ys.append(cy_top + r_top * np.sin(a))
-            x = cx2
-
-            # 5. Top flat
-            xs.append(x); ys.append(y_top)
-            x += w1
-            xs.append(x); ys.append(y_top)
-
-            # 6. Arc 3: π/2 → θ (top flat → down-web)
-            cx3 = x
-            for a in np.linspace(np.pi / 2, theta, pts_per_arc + 1)[1:]:
-                xs.append(cx3 + r_top * np.cos(a))
-                ys.append(cy_top + r_top * np.sin(a))
-
-            # 7. Web down — straight line to arc 4 start
-            cx4 = cx3 + r_top_out * cos_t + dx_web + r_bot_out * cos_t
-            xs.append(cx4 + r_bot * np.cos(np.pi + theta))
-            ys.append(cy_bot + r_bot * np.sin(np.pi + theta))
-
-            # 8. Arc 4: CCW (π+θ) → 3π/2 (down-web → bottom flat)
-            for a in np.linspace(np.pi + theta, 3 * np.pi / 2, pts_per_arc + 1)[1:]:
-                xs.append(cx4 + r_bot * np.cos(a))
-                ys.append(cy_bot + r_bot * np.sin(a))
-            x = cx4
-
-        # Final point to close the last flat
-        xs.append(x); ys.append(y_bot)
-        return np.array(xs), np.array(ys)
-
-    # Center the span so that the middle period is around x ≈ 0
+    # ── Build centerline points + right-hand normals ───────────────────────
+    xs, ys, nxs, nys = [], [], [], []
     x_start = -period * n_periods / 2
+    x = x_start
 
-    outer_x, outer_y = trace(r_bot_out, r_top_out, 0.0, H, x_start)
-    inner_x, inner_y = trace(r_bot_in, r_top_in, t, H - t, x_start)
+    # First point (bottom-flat start of first period)
+    xs.append(x); ys.append(y_cl_bot)
+    nxs.append(0.0); nys.append(-1.0)
 
-    # Central period element positions (period index 1 for n_periods=3)
+    n_web = max(3, pts_per_arc // 3)
+
+    for _ in range(n_periods):
+        # ─── Bottom flat end ───────────────────────────────────────────────
+        x += w2
+        xs.append(x); ys.append(y_cl_bot)
+        nxs.append(0.0); nys.append(-1.0)
+
+        # ─── Bottom-left arc: CCW –π/2 → –θ ──────────────────────────────
+        cx_bl = x
+        for a in np.linspace(-np.pi / 2, -theta, pts_per_arc + 1)[1:]:
+            xs.append(cx_bl + R_cl_bot * np.cos(a))
+            ys.append(cy_bot + R_cl_bot * np.sin(a))
+            nxs.append(np.cos(a)); nys.append(np.sin(a))
+
+        # ─── Up-web (intermediate points only) ────────────────────────────
+        cx_tl = cx_bl + dx_arc_bot + dx_web + dx_arc_top
+        ws_x = cx_bl + R_cl_bot * cos_t
+        ws_y = cy_bot - R_cl_bot * sin_t
+        we_x = cx_tl - R_cl_top * cos_t
+        we_y = cy_top + R_cl_top * sin_t
+        wdx = we_x - ws_x
+        wdy = we_y - ws_y
+        wl = np.hypot(wdx, wdy)
+        wnx = (wdy / wl) if wl > 1e-10 else cos_t
+        wny = (-wdx / wl) if wl > 1e-10 else -sin_t
+        for i in range(1, n_web + 1):
+            f = i / (n_web + 1)
+            xs.append(ws_x + f * wdx); ys.append(ws_y + f * wdy)
+            nxs.append(wnx); nys.append(wny)
+
+        # ─── Top-left arc: CW (π–θ) → π/2  (include start = web end) ─────
+        for a in np.linspace(np.pi - theta, np.pi / 2, pts_per_arc + 1):
+            xs.append(cx_tl + R_cl_top * np.cos(a))
+            ys.append(cy_top + R_cl_top * np.sin(a))
+            nxs.append(-np.cos(a)); nys.append(-np.sin(a))
+
+        x = cx_tl
+
+        # ─── Top flat end ─────────────────────────────────────────────────
+        x += w1
+        xs.append(x); ys.append(y_cl_top)
+        nxs.append(0.0); nys.append(-1.0)
+
+        # ─── Top-right arc: CW π/2 → θ  (skip first = flat end) ──────────
+        cx_tr = x
+        for a in np.linspace(np.pi / 2, theta, pts_per_arc + 1)[1:]:
+            xs.append(cx_tr + R_cl_top * np.cos(a))
+            ys.append(cy_top + R_cl_top * np.sin(a))
+            nxs.append(-np.cos(a)); nys.append(-np.sin(a))
+
+        # ─── Down-web (intermediate points only) ──────────────────────────
+        cx_br = cx_tr + dx_arc_top + dx_web + dx_arc_bot
+        ws2_x = cx_tr + R_cl_top * cos_t
+        ws2_y = cy_top + R_cl_top * sin_t
+        we2_x = cx_br - R_cl_bot * cos_t
+        we2_y = cy_bot - R_cl_bot * sin_t
+        wdx2 = we2_x - ws2_x
+        wdy2 = we2_y - ws2_y
+        wl2 = np.hypot(wdx2, wdy2)
+        wnx2 = (wdy2 / wl2) if wl2 > 1e-10 else -cos_t
+        wny2 = (-wdx2 / wl2) if wl2 > 1e-10 else -sin_t
+        for i in range(1, n_web + 1):
+            f = i / (n_web + 1)
+            xs.append(ws2_x + f * wdx2); ys.append(ws2_y + f * wdy2)
+            nxs.append(wnx2); nys.append(wny2)
+
+        # ─── Bottom-right arc: CCW (π+θ) → 3π/2  (include start = web end)
+        for a in np.linspace(np.pi + theta, 3 * np.pi / 2, pts_per_arc + 1):
+            xs.append(cx_br + R_cl_bot * np.cos(a))
+            ys.append(cy_bot + R_cl_bot * np.sin(a))
+            nxs.append(np.cos(a)); nys.append(np.sin(a))
+
+        x = cx_br
+
+    # Closing point
+    xs.append(x); ys.append(y_cl_bot)
+    nxs.append(0.0); nys.append(-1.0)
+
+    # ── Convert & offset ──────────────────────────────────────────────────
+    cl_x = np.array(xs);  cl_y = np.array(ys)
+    rn_x = np.array(nxs); rn_y = np.array(nys)
+
+    # Surface 1 ("right" offset): at y=0 on bottom flats
+    s1_x = cl_x + (t / 2) * rn_x
+    s1_y = cl_y + (t / 2) * rn_y
+    # Surface 2 ("left" offset): at y=t on bottom flats
+    s2_x = cl_x - (t / 2) * rn_x
+    s2_y = cl_y - (t / 2) * rn_y
+
+    # ── Info for dimension arrows (central period) ────────────────────────
     x_cp = x_start + period
     info = {
         'period': period,
         'x_bf_left': x_cp,
         'x_bf_right': x_cp + w2,
-        'x_tf_left': x_cp + w2 + r_bot_out * cos_t + dx_web + r_top_out * cos_t,
-        'x_tf_right': x_cp + w2 + r_bot_out * cos_t + dx_web + r_top_out * cos_t + w1,
+        'x_tf_left': x_cp + w2 + dx_transition,
+        'x_tf_right': x_cp + w2 + dx_transition + w1,
     }
-    return outer_x, outer_y, inner_x, inner_y, info
+
+    return s1_x, s1_y, s2_x, s2_y, info
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -248,8 +289,8 @@ def draw_geometry_preview(pattern_type, t,
             wall_x = np.concatenate([ox, ix[::-1]])
             wall_y = np.concatenate([oy, iy[::-1]])
             ax.fill(wall_x, wall_y, facecolor=FILL, edgecolor='none', zorder=2)
-            ax.plot(ox, oy, color=STROKE, lw=1.5, zorder=3)
-            ax.plot(ix, iy, color=STROKE, lw=0.8, zorder=3)
+            ax.plot(ox, oy, color=STROKE, lw=1.3, zorder=3)
+            ax.plot(ix, iy, color=STROKE, lw=1.3, zorder=3)
 
             period = info['period']
             x_bf_l = info['x_bf_left']
